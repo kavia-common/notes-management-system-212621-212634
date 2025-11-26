@@ -1,6 +1,7 @@
 #!/bin/bash
+set -euo pipefail
 
-# Minimal PostgreSQL startup script with full paths
+# Minimal PostgreSQL startup script with full paths, plus schema/seed application
 DB_NAME="myapp"
 DB_USER="appuser"
 DB_PASSWORD="dbuser123"
@@ -12,7 +13,28 @@ echo "Starting PostgreSQL setup..."
 PG_VERSION=$(ls /usr/lib/postgresql/ | head -1)
 PG_BIN="/usr/lib/postgresql/${PG_VERSION}/bin"
 
+if [ -z "${PG_VERSION}" ] || [ ! -x "${PG_BIN}/psql" ]; then
+  echo "Error: PostgreSQL binaries not found at ${PG_BIN}" >&2
+  exit 1
+fi
+
 echo "Found PostgreSQL version: ${PG_VERSION}"
+
+# Helper to run psql as postgres with error handling
+run_psql() {
+  local db="$1"
+  local sql_file="$2"
+  if [ ! -f "${sql_file}" ]; then
+    echo "Note: ${sql_file} not found; skipping."
+    return 0
+  fi
+  echo "Applying ${sql_file} to database '${db}'..."
+  if ! sudo -u postgres ${PG_BIN}/psql -v ON_ERROR_STOP=1 -p "${DB_PORT}" -d "${db}" -f "${sql_file}"; then
+    echo "Error: Failed to apply ${sql_file} to ${db}" >&2
+    exit 1
+  fi
+  echo "✓ Applied ${sql_file}"
+}
 
 # Check if PostgreSQL is already running on the specified port
 if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
@@ -28,6 +50,12 @@ if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
     if [ -f "db_connection.txt" ]; then
         echo "Or use: $(cat db_connection.txt)"
     fi
+
+    # Attempt to apply schema and seed even if server already running
+    run_psql "${DB_NAME}" "notes_database/schema.sql" || true
+    run_psql "${DB_NAME}" "notes_database/seed.sql" || true
+    run_psql "${DB_NAME}" "schema.sql" || true
+    run_psql "${DB_NAME}" "seed.sql" || true
     
     echo ""
     echo "Script stopped - server already running."
@@ -42,6 +70,11 @@ if pgrep -f "postgres.*-p ${DB_PORT}" > /dev/null 2>&1; then
     # Try to connect and verify the database exists
     if sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} -c '\q' 2>/dev/null; then
         echo "Database ${DB_NAME} is accessible."
+        # Apply schema/seed if present
+        run_psql "${DB_NAME}" "notes_database/schema.sql" || true
+        run_psql "${DB_NAME}" "notes_database/seed.sql" || true
+        run_psql "${DB_NAME}" "schema.sql" || true
+        run_psql "${DB_NAME}" "seed.sql" || true
         echo "Script stopped - server already running."
         exit 0
     fi
@@ -59,9 +92,6 @@ sudo -u postgres ${PG_BIN}/postgres -D /var/lib/postgresql/data -p ${DB_PORT} &
 
 # Wait for PostgreSQL to start
 echo "Waiting for PostgreSQL to start..."
-sleep 5
-
-# Check if PostgreSQL is running
 for i in {1..15}; do
     if sudo -u postgres ${PG_BIN}/pg_isready -p ${DB_PORT} > /dev/null 2>&1; then
         echo "PostgreSQL is ready!"
@@ -76,7 +106,7 @@ echo "Setting up database and user..."
 sudo -u postgres ${PG_BIN}/createdb -p ${DB_PORT} ${DB_NAME} 2>/dev/null || echo "Database might already exist"
 
 # Set up user and permissions with proper schema ownership
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d postgres << EOF
+sudo -u postgres ${PG_BIN}/psql -v ON_ERROR_STOP=1 -p ${DB_PORT} -d postgres << EOF
 -- Create user if doesn't exist
 DO \$\$
 BEGIN
@@ -91,7 +121,7 @@ END
 GRANT ALL PRIVILEGES ON DATABASE ${DB_NAME} TO ${DB_USER};
 
 -- Connect to the specific database for schema-level permissions
-\c ${DB_NAME}
+\\c ${DB_NAME}
 
 -- For PostgreSQL 15+, we need to handle public schema permissions differently
 -- First, grant usage on public schema
@@ -106,10 +136,6 @@ ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON FUNCTIONS TO ${DB_USER};
 ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TYPES TO ${DB_USER};
 
--- If you want the user to be able to create objects without restrictions,
--- you can make them the owner of the public schema (optional but effective)
--- ALTER SCHEMA public OWNER TO ${DB_USER};
-
 -- Alternative: Grant all privileges on schema public to the user
 GRANT ALL ON SCHEMA public TO ${DB_USER};
 
@@ -120,14 +146,21 @@ GRANT ALL PRIVILEGES ON ALL FUNCTIONS IN SCHEMA public TO ${DB_USER};
 EOF
 
 # Additionally, connect to the specific database to ensure permissions
-sudo -u postgres ${PG_BIN}/psql -p ${DB_PORT} -d ${DB_NAME} << EOF
+sudo -u postgres ${PG_BIN}/psql -v ON_ERROR_STOP=1 -p ${DB_PORT} -d ${DB_NAME} << EOF
 -- Double-check permissions are set correctly in the target database
 GRANT ALL ON SCHEMA public TO ${DB_USER};
 GRANT CREATE ON SCHEMA public TO ${DB_USER};
 
 -- Show current permissions for debugging
-\dn+ public
+\\dn+ public
 EOF
+
+# Apply schema and seed if present (try both relative locations for flexibility)
+run_psql "${DB_NAME}" "notes_database/schema.sql" || true
+run_psql "${DB_NAME}" "schema.sql" || true
+
+run_psql "${DB_NAME}" "notes_database/seed.sql" || true
+run_psql "${DB_NAME}" "seed.sql" || true
 
 # Save connection command to a file
 echo "psql postgresql://${DB_USER}:${DB_PASSWORD}@localhost:${DB_PORT}/${DB_NAME}" > db_connection.txt
